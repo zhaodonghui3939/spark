@@ -26,16 +26,15 @@ import org.apache.spark.{SecurityManager, SparkConf}
  * protocol to do a distributed transfer of the broadcasted data to the executors. Refer to
  * [[org.apache.spark.broadcast.TorrentBroadcast]] for more details.
  */
-class TorrentBroadcastFactory extends BroadcastFactory {
+private[spark] class TorrentBroadcastFactory extends BroadcastFactory {
 
-  override def initialize(isDriver: Boolean, conf: SparkConf, securityMgr: SecurityManager) {
-    TorrentBroadcast.initialize(isDriver, conf)
+  override def initialize(isDriver: Boolean, conf: SparkConf, securityMgr: SecurityManager) { }
+
+  override def newBroadcast[T: ClassTag](value_ : T, isLocal: Boolean, id: Long): Broadcast[T] = {
+    new TorrentBroadcast[T](value_, id)
   }
 
-  override def newBroadcast[T: ClassTag](value_ : T, isLocal: Boolean, id: Long) =
-    new TorrentBroadcast[T](value_, isLocal, id)
-
-  override def stop() { TorrentBroadcast.stop() }
+  override def stop() { }
 
   /**
    * Remove all persisted state associated with the torrent broadcast with the given ID.

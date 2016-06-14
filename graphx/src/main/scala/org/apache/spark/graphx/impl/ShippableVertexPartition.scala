@@ -19,24 +19,23 @@ package org.apache.spark.graphx.impl
 
 import scala.reflect.ClassTag
 
-import org.apache.spark.util.collection.{BitSet, PrimitiveVector}
-
 import org.apache.spark.graphx._
 import org.apache.spark.graphx.util.collection.GraphXPrimitiveKeyOpenHashMap
+import org.apache.spark.util.collection.{BitSet, PrimitiveVector}
 
 /** Stores vertex attributes to ship to an edge partition. */
 private[graphx]
 class VertexAttributeBlock[VD: ClassTag](val vids: Array[VertexId], val attrs: Array[VD])
   extends Serializable {
   def iterator: Iterator[(VertexId, VD)] =
-    (0 until vids.size).iterator.map { i => (vids(i), attrs(i)) }
+    (0 until vids.length).iterator.map { i => (vids(i), attrs(i)) }
 }
 
 private[graphx]
 object ShippableVertexPartition {
   /** Construct a `ShippableVertexPartition` from the given vertices without any routing table. */
   def apply[VD: ClassTag](iter: Iterator[(VertexId, VD)]): ShippableVertexPartition[VD] =
-    apply(iter, RoutingTablePartition.empty, null.asInstanceOf[VD])
+    apply(iter, RoutingTablePartition.empty, null.asInstanceOf[VD], (a, b) => a)
 
   /**
    * Construct a `ShippableVertexPartition` from the given vertices with the specified routing
@@ -44,10 +43,28 @@ object ShippableVertexPartition {
    */
   def apply[VD: ClassTag](
       iter: Iterator[(VertexId, VD)], routingTable: RoutingTablePartition, defaultVal: VD)
-    : ShippableVertexPartition[VD] = {
-    val fullIter = iter ++ routingTable.iterator.map(vid => (vid, defaultVal))
-    val (index, values, mask) = VertexPartitionBase.initFrom(fullIter, (a: VD, b: VD) => a)
-    new ShippableVertexPartition(index, values, mask, routingTable)
+    : ShippableVertexPartition[VD] =
+    apply(iter, routingTable, defaultVal, (a, b) => a)
+
+  /**
+   * Construct a `ShippableVertexPartition` from the given vertices with the specified routing
+   * table, filling in missing vertices mentioned in the routing table using `defaultVal`,
+   * and merging duplicate vertex attribute with mergeFunc.
+   */
+  def apply[VD: ClassTag](
+      iter: Iterator[(VertexId, VD)], routingTable: RoutingTablePartition, defaultVal: VD,
+      mergeFunc: (VD, VD) => VD): ShippableVertexPartition[VD] = {
+    val map = new GraphXPrimitiveKeyOpenHashMap[VertexId, VD]
+    // Merge the given vertices using mergeFunc
+    iter.foreach { pair =>
+      map.setMerge(pair._1, pair._2, mergeFunc)
+    }
+    // Fill in missing vertices mentioned in the routing table
+    routingTable.iterator.foreach { vid =>
+      map.changeValue(vid, defaultVal, identity)
+    }
+
+    new ShippableVertexPartition(map.keySet, map._values, map.keySet.getBitSet, routingTable)
   }
 
   import scala.language.implicitConversions
@@ -56,8 +73,8 @@ object ShippableVertexPartition {
    * Implicit conversion to allow invoking `VertexPartitionBase` operations directly on a
    * `ShippableVertexPartition`.
    */
-  implicit def shippablePartitionToOps[VD: ClassTag](partition: ShippableVertexPartition[VD]) =
-    new ShippableVertexPartitionOps(partition)
+  implicit def shippablePartitionToOps[VD: ClassTag](partition: ShippableVertexPartition[VD])
+    : ShippableVertexPartitionOps[VD] = new ShippableVertexPartitionOps(partition)
 
   /**
    * Implicit evidence that `ShippableVertexPartition` is a member of the
@@ -85,8 +102,8 @@ class ShippableVertexPartition[VD: ClassTag](
   extends VertexPartitionBase[VD] {
 
   /** Return a new ShippableVertexPartition with the specified routing table. */
-  def withRoutingTable(routingTable_ : RoutingTablePartition): ShippableVertexPartition[VD] = {
-    new ShippableVertexPartition(index, values, mask, routingTable_)
+  def withRoutingTable(_routingTable: RoutingTablePartition): ShippableVertexPartition[VD] = {
+    new ShippableVertexPartition(index, values, mask, _routingTable)
   }
 
   /**

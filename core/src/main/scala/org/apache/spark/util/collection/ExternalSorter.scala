@@ -20,15 +20,17 @@ package org.apache.spark.util.collection
 import java.io._
 import java.util.Comparator
 
-import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 
 import com.google.common.io.ByteStreams
 
 import org.apache.spark._
-import org.apache.spark.serializer.{DeserializationStream, Serializer}
 import org.apache.spark.executor.ShuffleWriteMetrics
-import org.apache.spark.storage.{BlockObjectWriter, BlockId}
+import org.apache.spark.internal.Logging
+import org.apache.spark.memory.TaskMemoryManager
+import org.apache.spark.serializer._
+import org.apache.spark.storage.{BlockId, DiskBlockObjectWriter}
 
 /**
  * Sorts and potentially merges a number of key-value pairs of type (K, V) to produce key-combiner
@@ -37,6 +39,11 @@ import org.apache.spark.storage.{BlockObjectWriter, BlockId}
  * partitioned file with a different byte range for each partition, suitable for shuffle fetches.
  *
  * If combining is disabled, the type C must equal V -- we'll cast the objects at the end.
+ *
+ * Note: Although ExternalSorter is a fairly generic sorter, some of its configuration is tied
+ * to its use in sort-based shuffle (for example, its block compression is controlled by
+ * `spark.shuffle.compress`).  We may need to revisit this if ExternalSorter is used in other
+ * non-shuffle contexts where we might want to use different configuration settings.
  *
  * @param aggregator optional Aggregator with combine functions to use for merging data
  * @param partitioner optional Partitioner; if given, sort by partition ID and then key
@@ -48,51 +55,62 @@ import org.apache.spark.storage.{BlockObjectWriter, BlockId}
  * probably want to pass None as the ordering to avoid extra sorting. On the other hand, if you do
  * want to do combining, having an Ordering is more efficient than not having it.
  *
- * At a high level, this class works as follows:
+ * Users interact with this class in the following way:
  *
- * - We repeatedly fill up buffers of in-memory data, using either a SizeTrackingAppendOnlyMap if
- *   we want to combine by key, or an simple SizeTrackingBuffer if we don't. Inside these buffers,
- *   we sort elements of type ((Int, K), C) where the Int is the partition ID. This is done to
- *   avoid calling the partitioner multiple times on the same key (e.g. for RangePartitioner).
+ * 1. Instantiate an ExternalSorter.
  *
- * - When each buffer reaches our memory limit, we spill it to a file. This file is sorted first
- *   by partition ID and possibly second by key or by hash code of the key, if we want to do
- *   aggregation. For each file, we track how many objects were in each partition in memory, so we
- *   don't have to write out the partition ID for every element.
+ * 2. Call insertAll() with a set of records.
  *
- * - When the user requests an iterator, the spilled files are merged, along with any remaining
- *   in-memory data, using the same sort order defined above (unless both sorting and aggregation
- *   are disabled). If we need to aggregate by key, we either use a total ordering from the
- *   ordering parameter, or read the keys with the same hash code and compare them with each other
- *   for equality to merge values.
+ * 3. Request an iterator() back to traverse sorted/aggregated records.
+ *     - or -
+ *    Invoke writePartitionedFile() to create a file containing sorted/aggregated outputs
+ *    that can be used in Spark's sort shuffle.
  *
- * - Users are expected to call stop() at the end to delete all the intermediate files.
+ * At a high level, this class works internally as follows:
  *
- * As a special case, if no Ordering and no Aggregator is given, and the number of partitions is
- * less than spark.shuffle.sort.bypassMergeThreshold, we bypass the merge-sort and just write to
- * separate files for each partition each time we spill, similar to the HashShuffleWriter. We can
- * then concatenate these files to produce a single sorted file, without having to serialize and
- * de-serialize each item twice (as is needed during the merge). This speeds up the map side of
- * groupBy, sort, etc operations since they do no partial aggregation.
+ *  - We repeatedly fill up buffers of in-memory data, using either a PartitionedAppendOnlyMap if
+ *    we want to combine by key, or a PartitionedPairBuffer if we don't.
+ *    Inside these buffers, we sort elements by partition ID and then possibly also by key.
+ *    To avoid calling the partitioner multiple times with each key, we store the partition ID
+ *    alongside each record.
+ *
+ *  - When each buffer reaches our memory limit, we spill it to a file. This file is sorted first
+ *    by partition ID and possibly second by key or by hash code of the key, if we want to do
+ *    aggregation. For each file, we track how many objects were in each partition in memory, so we
+ *    don't have to write out the partition ID for every element.
+ *
+ *  - When the user requests an iterator or file output, the spilled files are merged, along with
+ *    any remaining in-memory data, using the same sort order defined above (unless both sorting
+ *    and aggregation are disabled). If we need to aggregate by key, we either use a total ordering
+ *    from the ordering parameter, or read the keys with the same hash code and compare them with
+ *    each other for equality to merge values.
+ *
+ *  - Users are expected to call stop() at the end to delete all the intermediate files.
  */
 private[spark] class ExternalSorter[K, V, C](
+    context: TaskContext,
     aggregator: Option[Aggregator[K, V, C]] = None,
     partitioner: Option[Partitioner] = None,
     ordering: Option[Ordering[K]] = None,
-    serializer: Option[Serializer] = None) extends Logging {
+    serializer: Serializer = SparkEnv.get.serializer)
+  extends Spillable[WritablePartitionedPairCollection[K, C]](context.taskMemoryManager())
+  with Logging {
+
+  private val conf = SparkEnv.get.conf
 
   private val numPartitions = partitioner.map(_.numPartitions).getOrElse(1)
   private val shouldPartition = numPartitions > 1
+  private def getPartition(key: K): Int = {
+    if (shouldPartition) partitioner.get.getPartition(key) else 0
+  }
 
   private val blockManager = SparkEnv.get.blockManager
   private val diskBlockManager = blockManager.diskBlockManager
-  private val shuffleMemoryManager = SparkEnv.get.shuffleMemoryManager
-  private val ser = Serializer.getSerializer(serializer)
-  private val serInstance = ser.newInstance()
+  private val serializerManager = SparkEnv.get.serializerManager
+  private val serInstance = serializer.newInstance()
 
-  private val conf = SparkEnv.get.conf
-  private val spillingEnabled = conf.getBoolean("spark.shuffle.spill", true)
-  private val fileBufferSize = conf.getInt("spark.shuffle.file.buffer.kb", 32) * 1024
+  // Use getSizeAsKb (not bytes) to maintain backwards compatibility if no units are provided
+  private val fileBufferSize = conf.getSizeAsKb("spark.shuffle.file.buffer", "32k").toInt * 1024
 
   // Size of object batches when reading/writing from serializers.
   //
@@ -103,45 +121,23 @@ private[spark] class ExternalSorter[K, V, C](
   // grow internal data structures by growing + copying every time the number of objects doubles.
   private val serializerBatchSize = conf.getLong("spark.shuffle.spill.batchSize", 10000)
 
-  private def getPartition(key: K): Int = {
-    if (shouldPartition) partitioner.get.getPartition(key) else 0
-  }
-
   // Data structures to store in-memory objects before we spill. Depending on whether we have an
   // Aggregator set, we either put objects into an AppendOnlyMap where we combine them, or we
   // store them in an array buffer.
-  private var map = new SizeTrackingAppendOnlyMap[(Int, K), C]
-  private var buffer = new SizeTrackingPairBuffer[(Int, K), C]
-
-  // Number of pairs read from input since last spill; note that we count them even if a value is
-  // merged with a previous key in case we're doing something like groupBy where the result grows
-  private var elementsRead = 0L
-
-  // What threshold of elementsRead we start estimating map size at.
-  private val trackMemoryThreshold = 1000
+  @volatile private var map = new PartitionedAppendOnlyMap[K, C]
+  @volatile private var buffer = new PartitionedPairBuffer[K, C]
 
   // Total spilling statistics
-  private var spillCount = 0
-  private var _memoryBytesSpilled = 0L
   private var _diskBytesSpilled = 0L
+  def diskBytesSpilled: Long = _diskBytesSpilled
 
-  // Write metrics for current spill
-  private var curWriteMetrics: ShuffleWriteMetrics = _
+  // Peak size of the in-memory data structure observed so far, in bytes
+  private var _peakMemoryUsedBytes: Long = 0L
+  def peakMemoryUsedBytes: Long = _peakMemoryUsedBytes
 
-  // How much of the shared memory pool this collection has claimed
-  private var myMemoryThreshold = 0L
-
-  // If there are fewer than spark.shuffle.sort.bypassMergeThreshold partitions and we don't need
-  // local aggregation and sorting, write numPartitions files directly and just concatenate them
-  // at the end. This avoids doing serialization and deserialization twice to merge together the
-  // spilled files, which would happen with the normal code path. The downside is having multiple
-  // files open at a time and thus more memory allocated to buffers.
-  private val bypassMergeThreshold = conf.getInt("spark.shuffle.sort.bypassMergeThreshold", 200)
-  private val bypassMergeSort =
-    (numPartitions <= bypassMergeThreshold && aggregator.isEmpty && ordering.isEmpty)
-
-  // Array of file writers for each partition, used if bypassMergeSort is true and we've spilled
-  private var partitionWriters: Array[BlockObjectWriter] = null
+  @volatile private var isShuffleSort: Boolean = true
+  private val forceSpillFiles = new ArrayBuffer[SpilledFile]
+  @volatile private var readingIterator: SpillableIterator = null
 
   // A comparator for keys K that orders them within a partition to allow aggregation or sorting.
   // Can be a partial ordering by hash code if a total ordering is not provided through by the
@@ -152,34 +148,15 @@ private[spark] class ExternalSorter[K, V, C](
     override def compare(a: K, b: K): Int = {
       val h1 = if (a == null) 0 else a.hashCode()
       val h2 = if (b == null) 0 else b.hashCode()
-      h1 - h2
+      if (h1 < h2) -1 else if (h1 == h2) 0 else 1
     }
   })
 
-  // A comparator for (Int, K) pairs that orders them by only their partition ID
-  private val partitionComparator: Comparator[(Int, K)] = new Comparator[(Int, K)] {
-    override def compare(a: (Int, K), b: (Int, K)): Int = {
-      a._1 - b._1
-    }
-  }
-
-  // A comparator that orders (Int, K) pairs by partition ID and then possibly by key
-  private val partitionKeyComparator: Comparator[(Int, K)] = {
+  private def comparator: Option[Comparator[K]] = {
     if (ordering.isDefined || aggregator.isDefined) {
-      // Sort by partition ID then key comparator
-      new Comparator[(Int, K)] {
-        override def compare(a: (Int, K), b: (Int, K)): Int = {
-          val partitionDiff = a._1 - b._1
-          if (partitionDiff != 0) {
-            partitionDiff
-          } else {
-            keyComparator.compare(a._2, b._2)
-          }
-        }
-      }
+      Some(keyComparator)
     } else {
-      // Just sort it by partition ID
-      partitionComparator
+      None
     }
   }
 
@@ -191,9 +168,16 @@ private[spark] class ExternalSorter[K, V, C](
     blockId: BlockId,
     serializerBatchSizes: Array[Long],
     elementsPerPartition: Array[Long])
+
   private val spills = new ArrayBuffer[SpilledFile]
 
-  def insertAll(records: Iterator[_ <: Product2[K, V]]): Unit = {
+  /**
+   * Number of files this sorter has spilled so far.
+   * Exposed for testing.
+   */
+  private[spark] def numSpills: Int = spills.size
+
+  def insertAll(records: Iterator[Product2[K, V]]): Unit = {
     // TODO: stop combining if we find that the reduction factor isn't high
     val shouldCombine = aggregator.isDefined
 
@@ -206,18 +190,18 @@ private[spark] class ExternalSorter[K, V, C](
         if (hadValue) mergeValue(oldValue, kv._2) else createCombiner(kv._2)
       }
       while (records.hasNext) {
-        elementsRead += 1
+        addElementsRead()
         kv = records.next()
         map.changeValue((getPartition(kv._1), kv._1), update)
-        maybeSpill(usingMap = true)
+        maybeSpillCollection(usingMap = true)
       }
     } else {
       // Stick values into our buffer
       while (records.hasNext) {
-        elementsRead += 1
+        addElementsRead()
         val kv = records.next()
-        buffer.insert((getPartition(kv._1), kv._1), kv._2.asInstanceOf[C])
-        maybeSpill(usingMap = false)
+        buffer.insert(getPartition(kv._1), kv._1, kv._2.asInstanceOf[C])
+        maybeSpillCollection(usingMap = false)
       }
     }
   }
@@ -227,79 +211,75 @@ private[spark] class ExternalSorter[K, V, C](
    *
    * @param usingMap whether we're using a map or buffer as our current in-memory collection
    */
-  private def maybeSpill(usingMap: Boolean): Unit = {
-    if (!spillingEnabled) {
-      return
-    }
-
-    val collection: SizeTrackingPairCollection[(Int, K), C] = if (usingMap) map else buffer
-
-    // TODO: factor this out of both here and ExternalAppendOnlyMap
-    if (elementsRead > trackMemoryThreshold && elementsRead % 32 == 0 &&
-        collection.estimateSize() >= myMemoryThreshold)
-    {
-      // Claim up to double our current memory from the shuffle memory pool
-      val currentMemory = collection.estimateSize()
-      val amountToRequest = 2 * currentMemory - myMemoryThreshold
-      val granted = shuffleMemoryManager.tryToAcquire(amountToRequest)
-      myMemoryThreshold += granted
-      if (myMemoryThreshold <= currentMemory) {
-        // We were granted too little memory to grow further (either tryToAcquire returned 0,
-        // or we already had more memory than myMemoryThreshold); spill the current collection
-        spill(currentMemory, usingMap)  // Will also release memory back to ShuffleMemoryManager
+  private def maybeSpillCollection(usingMap: Boolean): Unit = {
+    var estimatedSize = 0L
+    if (usingMap) {
+      estimatedSize = map.estimateSize()
+      if (maybeSpill(map, estimatedSize)) {
+        map = new PartitionedAppendOnlyMap[K, C]
+      }
+    } else {
+      estimatedSize = buffer.estimateSize()
+      if (maybeSpill(buffer, estimatedSize)) {
+        buffer = new PartitionedPairBuffer[K, C]
       }
     }
+
+    if (estimatedSize > _peakMemoryUsedBytes) {
+      _peakMemoryUsedBytes = estimatedSize
+    }
   }
 
   /**
-   * Spill the current in-memory collection to disk, adding a new file to spills, and clear it.
-   *
-   * @param usingMap whether we're using a map or buffer as our current in-memory collection
-   */
-  private def spill(memorySize: Long, usingMap: Boolean): Unit = {
-    val collection: SizeTrackingPairCollection[(Int, K), C] = if (usingMap) map else buffer
-    val memorySize = collection.estimateSize()
-
-    spillCount += 1
-    val threadId = Thread.currentThread().getId
-    logInfo("Thread %d spilling in-memory batch of %d MB to disk (%d spill%s so far)"
-      .format(threadId, memorySize / (1024 * 1024), spillCount, if (spillCount > 1) "s" else ""))
-
-    if (bypassMergeSort) {
-      spillToPartitionFiles(collection)
-    } else {
-      spillToMergeableFile(collection)
-    }
-
-    if (usingMap) {
-      map = new SizeTrackingAppendOnlyMap[(Int, K), C]
-    } else {
-      buffer = new SizeTrackingPairBuffer[(Int, K), C]
-    }
-
-    // Release our memory back to the shuffle pool so that other threads can grab it
-    shuffleMemoryManager.release(myMemoryThreshold)
-    myMemoryThreshold = 0
-
-    _memoryBytesSpilled += memorySize
-  }
-
-  /**
-   * Spill our in-memory collection to a sorted file that we can merge later (normal code path).
-   * We add this file into spilledFiles to find it later.
-   *
-   * Alternatively, if bypassMergeSort is true, we spill to separate files for each partition.
-   * See spillToPartitionedFiles() for that code path.
+   * Spill our in-memory collection to a sorted file that we can merge later.
+   * We add this file into `spilledFiles` to find it later.
    *
    * @param collection whichever collection we're using (map or buffer)
    */
-  private def spillToMergeableFile(collection: SizeTrackingPairCollection[(Int, K), C]): Unit = {
-    assert(!bypassMergeSort)
+  override protected[this] def spill(collection: WritablePartitionedPairCollection[K, C]): Unit = {
+    val inMemoryIterator = collection.destructiveSortedWritablePartitionedIterator(comparator)
+    val spillFile = spillMemoryIteratorToDisk(inMemoryIterator)
+    spills.append(spillFile)
+  }
 
-    val (blockId, file) = diskBlockManager.createTempBlock()
-    curWriteMetrics = new ShuffleWriteMetrics()
-    var writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, curWriteMetrics)
-    var objectsWritten = 0   // Objects written since the last flush
+  /**
+   * Force to spilling the current in-memory collection to disk to release memory,
+   * It will be called by TaskMemoryManager when there is not enough memory for the task.
+   */
+  override protected[this] def forceSpill(): Boolean = {
+    if (isShuffleSort) {
+      false
+    } else {
+      assert(readingIterator != null)
+      val isSpilled = readingIterator.spill()
+      if (isSpilled) {
+        map = null
+        buffer = null
+      }
+      isSpilled
+    }
+  }
+
+  /**
+   * Spill contents of in-memory iterator to a temporary file on disk.
+   */
+  private[this] def spillMemoryIteratorToDisk(inMemoryIterator: WritablePartitionedIterator)
+      : SpilledFile = {
+    // Because these files may be read during shuffle, their compression must be controlled by
+    // spark.shuffle.compress instead of spark.shuffle.spill.compress, so we need to use
+    // createTempShuffleBlock here; see SPARK-3426 for more context.
+    val (blockId, file) = diskBlockManager.createTempShuffleBlock()
+
+    // These variables are reset after each flush
+    var objectsWritten: Long = 0
+    var spillMetrics: ShuffleWriteMetrics = null
+    var writer: DiskBlockObjectWriter = null
+    def openWriter(): Unit = {
+      assert (writer == null && spillMetrics == null)
+      spillMetrics = new ShuffleWriteMetrics
+      writer = blockManager.getDiskWriter(blockId, file, serInstance, fileBufferSize, spillMetrics)
+    }
+    openWriter()
 
     // List of batch sizes (bytes) in the order they are written to disk
     val batchSizes = new ArrayBuffer[Long]
@@ -309,32 +289,29 @@ private[spark] class ExternalSorter[K, V, C](
 
     // Flush the disk writer's contents to disk, and update relevant variables.
     // The writer is closed at the end of this process, and cannot be reused.
-    def flush() = {
+    def flush(): Unit = {
       val w = writer
       writer = null
       w.commitAndClose()
-      _diskBytesSpilled += curWriteMetrics.shuffleBytesWritten
-      batchSizes.append(curWriteMetrics.shuffleBytesWritten)
+      _diskBytesSpilled += spillMetrics.bytesWritten
+      batchSizes.append(spillMetrics.bytesWritten)
+      spillMetrics = null
       objectsWritten = 0
     }
 
     var success = false
     try {
-      val it = collection.destructiveSortedIterator(partitionKeyComparator)
-      while (it.hasNext) {
-        val elem = it.next()
-        val partitionId = elem._1._1
-        val key = elem._1._2
-        val value = elem._2
-        writer.write(key)
-        writer.write(value)
+      while (inMemoryIterator.hasNext) {
+        val partitionId = inMemoryIterator.nextPartition()
+        require(partitionId >= 0 && partitionId < numPartitions,
+          s"partition Id: ${partitionId} should be in the range [0, ${numPartitions})")
+        inMemoryIterator.writeNext(writer)
         elementsPerPartition(partitionId) += 1
         objectsWritten += 1
 
         if (objectsWritten == serializerBatchSize) {
           flush()
-          curWriteMetrics = new ShuffleWriteMetrics()
-          writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, curWriteMetrics)
+          openWriter()
         }
       }
       if (objectsWritten > 0) {
@@ -353,41 +330,14 @@ private[spark] class ExternalSorter[K, V, C](
           writer.revertPartialWritesAndClose()
         }
         if (file.exists()) {
-          file.delete()
+          if (!file.delete()) {
+            logWarning(s"Error deleting ${file}")
+          }
         }
       }
     }
 
-    spills.append(SpilledFile(file, blockId, batchSizes.toArray, elementsPerPartition))
-  }
-
-  /**
-   * Spill our in-memory collection to separate files, one for each partition. This is used when
-   * there's no aggregator and ordering and the number of partitions is small, because it allows
-   * writePartitionedFile to just concatenate files without deserializing data.
-   *
-   * @param collection whichever collection we're using (map or buffer)
-   */
-  private def spillToPartitionFiles(collection: SizeTrackingPairCollection[(Int, K), C]): Unit = {
-    assert(bypassMergeSort)
-
-    // Create our file writers if we haven't done so yet
-    if (partitionWriters == null) {
-      curWriteMetrics = new ShuffleWriteMetrics()
-      partitionWriters = Array.fill(numPartitions) {
-        val (blockId, file) = diskBlockManager.createTempBlock()
-        blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, curWriteMetrics).open()
-      }
-    }
-
-    val it = collection.iterator  // No need to sort stuff, just write each element out
-    while (it.hasNext) {
-      val elem = it.next()
-      val partitionId = elem._1._1
-      val key = elem._1._2
-      val value = elem._2
-      partitionWriters(partitionId).write((key, value))
-    }
+    SpilledFile(file, blockId, batchSizes.toArray, elementsPerPartition)
   }
 
   /**
@@ -524,7 +474,8 @@ private[spark] class ExternalSorter[K, V, C](
           val k = elem._1
           var c = elem._2
           while (sorted.hasNext && sorted.head._1 == k) {
-            c = mergeCombiners(c, sorted.head._2)
+            val pair = sorted.next()
+            c = mergeCombiners(c, pair._2)
           }
           (k, c)
         }
@@ -582,7 +533,7 @@ private[spark] class ExternalSorter[K, V, C](
           ", batchOffsets = " + batchOffsets.mkString("[", ", ", "]"))
 
         val bufferedStream = new BufferedInputStream(ByteStreams.limit(fileStream, end - start))
-        val compressedStream = blockManager.wrapForCompression(spill.blockId, bufferedStream)
+        val compressedStream = serializerManager.wrapForCompression(spill.blockId, bufferedStream)
         serInstance.deserializeStream(compressedStream)
       } else {
         // No more batches left
@@ -614,8 +565,8 @@ private[spark] class ExternalSorter[K, V, C](
       if (finished || deserializeStream == null) {
         return null
       }
-      val k = deserializeStream.readObject().asInstanceOf[K]
-      val c = deserializeStream.readObject().asInstanceOf[C]
+      val k = deserializeStream.readKey().asInstanceOf[K]
+      val c = deserializeStream.readValue().asInstanceOf[C]
       lastPartitionId = partitionId
       // Start reading the next batch if we're done with this one
       indexInBatch += 1
@@ -678,6 +629,20 @@ private[spark] class ExternalSorter[K, V, C](
   }
 
   /**
+   * Returns a destructive iterator for iterating over the entries of this map.
+   * If this iterator is forced spill to disk to release memory when there is not enough memory,
+   * it returns pairs from an on-disk map.
+   */
+  def destructiveIterator(memoryIterator: Iterator[((Int, K), C)]): Iterator[((Int, K), C)] = {
+    if (isShuffleSort) {
+      memoryIterator
+    } else {
+      readingIterator = new SpillableIterator(memoryIterator)
+      readingIterator
+    }
+  }
+
+  /**
    * Return an iterator over all the data written to this object, grouped by partition and
    * aggregated by the requested aggregator. For each partition we then have an iterator over its
    * contents, and these are expected to be accessed in order (you can't "skip ahead" to one
@@ -686,150 +651,102 @@ private[spark] class ExternalSorter[K, V, C](
    *
    * For now, we just merge all the spilled files in once pass, but this can be modified to
    * support hierarchical merging.
+   * Exposed for testing.
    */
   def partitionedIterator: Iterator[(Int, Iterator[Product2[K, C]])] = {
     val usingMap = aggregator.isDefined
-    val collection: SizeTrackingPairCollection[(Int, K), C] = if (usingMap) map else buffer
-    if (spills.isEmpty && partitionWriters == null) {
+    val collection: WritablePartitionedPairCollection[K, C] = if (usingMap) map else buffer
+    if (spills.isEmpty) {
       // Special case: if we have only in-memory data, we don't need to merge streams, and perhaps
       // we don't even need to sort by anything other than partition ID
       if (!ordering.isDefined) {
         // The user hasn't requested sorted keys, so only sort by partition ID, not key
-        groupByPartition(collection.destructiveSortedIterator(partitionComparator))
+        groupByPartition(destructiveIterator(collection.partitionedDestructiveSortedIterator(None)))
       } else {
         // We do need to sort by both partition ID and key
-        groupByPartition(collection.destructiveSortedIterator(partitionKeyComparator))
-      }
-    } else if (bypassMergeSort) {
-      // Read data from each partition file and merge it together with the data in memory;
-      // note that there's no ordering or aggregator in this case -- we just partition objects
-      val collIter = groupByPartition(collection.destructiveSortedIterator(partitionComparator))
-      collIter.map { case (partitionId, values) =>
-        (partitionId, values ++ readPartitionFile(partitionWriters(partitionId)))
+        groupByPartition(destructiveIterator(
+          collection.partitionedDestructiveSortedIterator(Some(keyComparator))))
       }
     } else {
       // Merge spilled and in-memory data
-      merge(spills, collection.destructiveSortedIterator(partitionKeyComparator))
+      merge(spills, destructiveIterator(
+        collection.partitionedDestructiveSortedIterator(comparator)))
     }
   }
 
   /**
    * Return an iterator over all the data written to this object, aggregated by our aggregator.
    */
-  def iterator: Iterator[Product2[K, C]] = partitionedIterator.flatMap(pair => pair._2)
-
-  /**
-   * Write all the data added into this ExternalSorter into a file in the disk store, creating
-   * an .index file for it as well with the offsets of each partition. This is called by the
-   * SortShuffleWriter and can go through an efficient path of just concatenating binary files
-   * if we decided to avoid merge-sorting.
-   *
-   * @param blockId block ID to write to. The index file will be blockId.name + ".index".
-   * @param context a TaskContext for a running Spark task, for us to update shuffle metrics.
-   * @return array of lengths, in bytes, of each partition of the file (used by map output tracker)
-   */
-  def writePartitionedFile(blockId: BlockId, context: TaskContext): Array[Long] = {
-    val outputFile = blockManager.diskBlockManager.getFile(blockId)
-
-    // Track location of each range in the output file
-    val offsets = new Array[Long](numPartitions + 1)
-    val lengths = new Array[Long](numPartitions)
-
-    if (bypassMergeSort && partitionWriters != null) {
-      // We decided to write separate files for each partition, so just concatenate them. To keep
-      // this simple we spill out the current in-memory collection so that everything is in files.
-      spillToPartitionFiles(if (aggregator.isDefined) map else buffer)
-      partitionWriters.foreach(_.commitAndClose())
-      var out: FileOutputStream = null
-      var in: FileInputStream = null
-      try {
-        out = new FileOutputStream(outputFile)
-        for (i <- 0 until numPartitions) {
-          val file = partitionWriters(i).fileSegment().file
-          in = new FileInputStream(file)
-          org.apache.spark.util.Utils.copyStream(in, out)
-          in.close()
-          in = null
-          lengths(i) = file.length()
-          offsets(i + 1) = offsets(i) + lengths(i)
-        }
-      } finally {
-        if (out != null) {
-          out.close()
-        }
-        if (in != null) {
-          in.close()
-        }
-      }
-    } else {
-      // Either we're not bypassing merge-sort or we have only in-memory data; get an iterator by
-      // partition and just write everything directly.
-      for ((id, elements) <- this.partitionedIterator) {
-        if (elements.hasNext) {
-          val writer = blockManager.getDiskWriter(
-            blockId, outputFile, ser, fileBufferSize, context.taskMetrics.shuffleWriteMetrics.get)
-          for (elem <- elements) {
-            writer.write(elem)
-          }
-          writer.commitAndClose()
-          val segment = writer.fileSegment()
-          offsets(id + 1) = segment.offset + segment.length
-          lengths(id) = segment.length
-        } else {
-          // The partition is empty; don't create a new writer to avoid writing headers, etc
-          offsets(id + 1) = offsets(id)
-        }
-      }
-    }
-
-    context.taskMetrics.memoryBytesSpilled += memoryBytesSpilled
-    context.taskMetrics.diskBytesSpilled += diskBytesSpilled
-
-    // Write an index file with the offsets of each block, plus a final offset at the end for the
-    // end of the output file. This will be used by SortShuffleManager.getBlockLocation to figure
-    // out where each block begins and ends.
-
-    val diskBlockManager = blockManager.diskBlockManager
-    val indexFile = diskBlockManager.getFile(blockId.name + ".index")
-    val out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(indexFile)))
-    try {
-      var i = 0
-      while (i < numPartitions + 1) {
-        out.writeLong(offsets(i))
-        i += 1
-      }
-    } finally {
-      out.close()
-    }
-
-    lengths
+  def iterator: Iterator[Product2[K, C]] = {
+    isShuffleSort = false
+    partitionedIterator.flatMap(pair => pair._2)
   }
 
   /**
-   * Read a partition file back as an iterator (used in our iterator method)
+   * Write all the data added into this ExternalSorter into a file in the disk store. This is
+   * called by the SortShuffleWriter.
+   *
+   * @param blockId block ID to write to. The index file will be blockId.name + ".index".
+   * @return array of lengths, in bytes, of each partition of the file (used by map output tracker)
    */
-  def readPartitionFile(writer: BlockObjectWriter): Iterator[Product2[K, C]] = {
-    if (writer.isOpen) {
-      writer.commitAndClose()
+  def writePartitionedFile(
+      blockId: BlockId,
+      outputFile: File): Array[Long] = {
+
+    val writeMetrics = context.taskMetrics().shuffleWriteMetrics
+
+    // Track location of each range in the output file
+    val lengths = new Array[Long](numPartitions)
+
+    if (spills.isEmpty) {
+      // Case where we only have in-memory data
+      val collection = if (aggregator.isDefined) map else buffer
+      val it = collection.destructiveSortedWritablePartitionedIterator(comparator)
+      while (it.hasNext) {
+        val writer = blockManager.getDiskWriter(
+          blockId, outputFile, serInstance, fileBufferSize, writeMetrics)
+        val partitionId = it.nextPartition()
+        while (it.hasNext && it.nextPartition() == partitionId) {
+          it.writeNext(writer)
+        }
+        writer.commitAndClose()
+        val segment = writer.fileSegment()
+        lengths(partitionId) = segment.length
+      }
+    } else {
+      // We must perform merge-sort; get an iterator by partition and write everything directly.
+      for ((id, elements) <- this.partitionedIterator) {
+        if (elements.hasNext) {
+          val writer = blockManager.getDiskWriter(
+            blockId, outputFile, serInstance, fileBufferSize, writeMetrics)
+          for (elem <- elements) {
+            writer.write(elem._1, elem._2)
+          }
+          writer.commitAndClose()
+          val segment = writer.fileSegment()
+          lengths(id) = segment.length
+        }
+      }
     }
-    blockManager.getLocalFromDisk(writer.blockId, ser).get.asInstanceOf[Iterator[Product2[K, C]]]
+
+    context.taskMetrics().incMemoryBytesSpilled(memoryBytesSpilled)
+    context.taskMetrics().incDiskBytesSpilled(diskBytesSpilled)
+    context.taskMetrics().incPeakExecutionMemory(peakMemoryUsedBytes)
+
+    lengths
   }
 
   def stop(): Unit = {
     spills.foreach(s => s.file.delete())
     spills.clear()
-    if (partitionWriters != null) {
-      partitionWriters.foreach { w =>
-        w.revertPartialWritesAndClose()
-        diskBlockManager.getFile(w.blockId).delete()
-      }
-      partitionWriters = null
+    forceSpillFiles.foreach(s => s.file.delete())
+    forceSpillFiles.clear()
+    if (map != null || buffer != null) {
+      map = null // So that the memory can be garbage-collected
+      buffer = null // So that the memory can be garbage-collected
+      releaseMemory()
     }
   }
-
-  def memoryBytesSpilled: Long = _memoryBytesSpilled
-
-  def diskBytesSpilled: Long = _diskBytesSpilled
 
   /**
    * Given a stream of ((partition, key), combiner) pairs *assumed to be sorted by partition ID*,
@@ -860,6 +777,68 @@ private[spark] class ExternalSorter[K, V, C](
       }
       val elem = data.next()
       (elem._1._2, elem._2)
+    }
+  }
+
+  private[this] class SpillableIterator(var upstream: Iterator[((Int, K), C)])
+    extends Iterator[((Int, K), C)] {
+
+    private val SPILL_LOCK = new Object()
+
+    private var nextUpstream: Iterator[((Int, K), C)] = null
+
+    private var cur: ((Int, K), C) = readNext()
+
+    private var hasSpilled: Boolean = false
+
+    def spill(): Boolean = SPILL_LOCK.synchronized {
+      if (hasSpilled) {
+        false
+      } else {
+        val inMemoryIterator = new WritablePartitionedIterator {
+          private[this] var cur = if (upstream.hasNext) upstream.next() else null
+
+          def writeNext(writer: DiskBlockObjectWriter): Unit = {
+            writer.write(cur._1._2, cur._2)
+            cur = if (upstream.hasNext) upstream.next() else null
+          }
+
+          def hasNext(): Boolean = cur != null
+
+          def nextPartition(): Int = cur._1._1
+        }
+        logInfo(s"Task ${context.taskAttemptId} force spilling in-memory map to disk and " +
+          s" it will release ${org.apache.spark.util.Utils.bytesToString(getUsed())} memory")
+        val spillFile = spillMemoryIteratorToDisk(inMemoryIterator)
+        forceSpillFiles.append(spillFile)
+        val spillReader = new SpillReader(spillFile)
+        nextUpstream = (0 until numPartitions).iterator.flatMap { p =>
+          val iterator = spillReader.readNextPartition()
+          iterator.map(cur => ((p, cur._1), cur._2))
+        }
+        hasSpilled = true
+        true
+      }
+    }
+
+    def readNext(): ((Int, K), C) = SPILL_LOCK.synchronized {
+      if (nextUpstream != null) {
+        upstream = nextUpstream
+        nextUpstream = null
+      }
+      if (upstream.hasNext) {
+        upstream.next()
+      } else {
+        null
+      }
+    }
+
+    override def hasNext(): Boolean = cur != null
+
+    override def next(): ((Int, K), C) = {
+      val r = cur
+      cur = readNext()
+      r
     }
   }
 }

@@ -17,30 +17,35 @@
 
 package org.apache.spark.api.java
 
+import java.io.Closeable
 import java.util
 import java.util.{Map => JMap}
 
-import scala.collection.JavaConversions
-import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
 import scala.language.implicitConversions
 import scala.reflect.ClassTag
 
-import com.google.common.base.Optional
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.mapred.{InputFormat, JobConf}
 import org.apache.hadoop.mapreduce.{InputFormat => NewInputFormat}
 
 import org.apache.spark._
-import org.apache.spark.SparkContext.{DoubleAccumulatorParam, IntAccumulatorParam}
+import org.apache.spark.AccumulatorParam._
 import org.apache.spark.api.java.JavaSparkContext.fakeClassTag
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.input.PortableDataStream
 import org.apache.spark.rdd.{EmptyRDD, HadoopRDD, NewHadoopRDD, RDD}
 
 /**
  * A Java-friendly version of [[org.apache.spark.SparkContext]] that returns
  * [[org.apache.spark.api.java.JavaRDD]]s and works with Java collections instead of Scala ones.
+ *
+ * Only one SparkContext may be active per JVM.  You must `stop()` the active SparkContext before
+ * creating a new one.  This limitation may eventually be removed; see SPARK-2243 for more details.
  */
-class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWorkaround {
+class JavaSparkContext(val sc: SparkContext)
+  extends JavaSparkContextVarargsWorkaround with Closeable {
+
   /**
    * Create a JavaSparkContext that loads settings from system properties (for instance, when
    * launching with ./bin/spark-submit).
@@ -96,9 +101,11 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    */
   def this(master: String, appName: String, sparkHome: String, jars: Array[String],
       environment: JMap[String, String]) =
-    this(new SparkContext(master, appName, sparkHome, jars.toSeq, environment, Map()))
+    this(new SparkContext(master, appName, sparkHome, jars.toSeq, environment.asScala))
 
   private[spark] val env = sc.env
+
+  def statusTracker: JavaSparkStatusTracker = new JavaSparkStatusTracker(sc)
 
   def isLocal: java.lang.Boolean = sc.isLocal
 
@@ -108,7 +115,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
 
   def appName: String = sc.appName
 
-  def jars: util.List[String] = sc.jars
+  def jars: util.List[String] = sc.jars.asJava
 
   def startTime: java.lang.Long = sc.startTime
 
@@ -118,21 +125,13 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   /** Default level of parallelism to use when not given by user (e.g. parallelize and makeRDD). */
   def defaultParallelism: java.lang.Integer = sc.defaultParallelism
 
-  /**
-   * Default min number of partitions for Hadoop RDDs when not given by user.
-   * @deprecated As of Spark 1.0.0, defaultMinSplits is deprecated, use
-   *            {@link #defaultMinPartitions()} instead
-   */
-  @deprecated("use defaultMinPartitions", "1.0.0")
-  def defaultMinSplits: java.lang.Integer = sc.defaultMinSplits
-
   /** Default min number of partitions for Hadoop RDDs when not given by user */
   def defaultMinPartitions: java.lang.Integer = sc.defaultMinPartitions
 
   /** Distribute a local Scala collection to form an RDD. */
   def parallelize[T](list: java.util.List[T], numSlices: Int): JavaRDD[T] = {
     implicit val ctag: ClassTag[T] = fakeClassTag
-    sc.parallelize(JavaConversions.asScalaBuffer(list), numSlices)
+    sc.parallelize(list.asScala, numSlices)
   }
 
   /** Get an RDD that has no partitions or elements. */
@@ -151,7 +150,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   : JavaPairRDD[K, V] = {
     implicit val ctagK: ClassTag[K] = fakeClassTag
     implicit val ctagV: ClassTag[V] = fakeClassTag
-    JavaPairRDD.fromRDD(sc.parallelize(JavaConversions.asScalaBuffer(list), numSlices))
+    JavaPairRDD.fromRDD(sc.parallelize(list.asScala, numSlices))
   }
 
   /** Distribute a local Scala collection to form an RDD. */
@@ -160,8 +159,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
 
   /** Distribute a local Scala collection to form an RDD. */
   def parallelizeDoubles(list: java.util.List[java.lang.Double], numSlices: Int): JavaDoubleRDD =
-    JavaDoubleRDD.fromRDD(sc.parallelize(JavaConversions.asScalaBuffer(list).map(_.doubleValue()),
-      numSlices))
+    JavaDoubleRDD.fromRDD(sc.parallelize(list.asScala.map(_.doubleValue()), numSlices))
 
   /** Distribute a local Scala collection to form an RDD. */
   def parallelizeDoubles(list: java.util.List[java.lang.Double]): JavaDoubleRDD =
@@ -180,6 +178,8 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   def textFile(path: String, minPartitions: Int): JavaRDD[String] =
     sc.textFile(path, minPartitions)
 
+
+
   /**
    * Read a directory of text files from HDFS, a local file system (available on all nodes), or any
    * Hadoop-supported file system URI. Each file is read as a single record and returned in a
@@ -193,7 +193,10 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    *   hdfs://a-hdfs-path/part-nnnnn
    * }}}
    *
-   * Do `JavaPairRDD<String, String> rdd = sparkContext.wholeTextFiles("hdfs://a-hdfs-path")`,
+   * Do
+   * {{{
+   *   JavaPairRDD<String, String> rdd = sparkContext.wholeTextFiles("hdfs://a-hdfs-path")
+   * }}}
    *
    * <p> then `rdd` contains
    * {{{
@@ -220,13 +223,86 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   def wholeTextFiles(path: String): JavaPairRDD[String, String] =
     new JavaPairRDD(sc.wholeTextFiles(path))
 
-  /** Get an RDD for a Hadoop SequenceFile with given key and value types.
-    *
-    * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
-    * record, directly caching the returned RDD will create many references to the same object.
-    * If you plan to directly cache Hadoop writable objects, you should first copy them using
-    * a `map` function.
-    * */
+  /**
+   * Read a directory of binary files from HDFS, a local file system (available on all nodes),
+   * or any Hadoop-supported file system URI as a byte array. Each file is read as a single
+   * record and returned in a key-value pair, where the key is the path of each file,
+   * the value is the content of each file.
+   *
+   * For example, if you have the following files:
+   * {{{
+   *   hdfs://a-hdfs-path/part-00000
+   *   hdfs://a-hdfs-path/part-00001
+   *   ...
+   *   hdfs://a-hdfs-path/part-nnnnn
+   * }}}
+   *
+   * Do
+   * `JavaPairRDD<String, byte[]> rdd = sparkContext.dataStreamFiles("hdfs://a-hdfs-path")`,
+   *
+   * then `rdd` contains
+   * {{{
+   *   (a-hdfs-path/part-00000, its content)
+   *   (a-hdfs-path/part-00001, its content)
+   *   ...
+   *   (a-hdfs-path/part-nnnnn, its content)
+   * }}}
+   *
+   * @note Small files are preferred; very large files but may cause bad performance.
+   *
+   * @param minPartitions A suggestion value of the minimal splitting number for input data.
+   */
+  def binaryFiles(path: String, minPartitions: Int): JavaPairRDD[String, PortableDataStream] =
+    new JavaPairRDD(sc.binaryFiles(path, minPartitions))
+
+  /**
+   * Read a directory of binary files from HDFS, a local file system (available on all nodes),
+   * or any Hadoop-supported file system URI as a byte array. Each file is read as a single
+   * record and returned in a key-value pair, where the key is the path of each file,
+   * the value is the content of each file.
+   *
+   * For example, if you have the following files:
+   * {{{
+   *   hdfs://a-hdfs-path/part-00000
+   *   hdfs://a-hdfs-path/part-00001
+   *   ...
+   *   hdfs://a-hdfs-path/part-nnnnn
+   * }}}
+   *
+   * Do
+   * `JavaPairRDD<String, byte[]> rdd = sparkContext.dataStreamFiles("hdfs://a-hdfs-path")`,
+   *
+   * then `rdd` contains
+   * {{{
+   *   (a-hdfs-path/part-00000, its content)
+   *   (a-hdfs-path/part-00001, its content)
+   *   ...
+   *   (a-hdfs-path/part-nnnnn, its content)
+   * }}}
+   *
+   * @note Small files are preferred; very large files but may cause bad performance.
+   */
+  def binaryFiles(path: String): JavaPairRDD[String, PortableDataStream] =
+    new JavaPairRDD(sc.binaryFiles(path, defaultMinPartitions))
+
+  /**
+   * Load data from a flat binary file, assuming the length of each record is constant.
+   *
+   * @param path Directory to the input data files
+   * @return An RDD of data with values, represented as byte arrays
+   */
+  def binaryRecords(path: String, recordLength: Int): JavaRDD[Array[Byte]] = {
+    new JavaRDD(sc.binaryRecords(path, recordLength))
+  }
+
+  /**
+   * Get an RDD for a Hadoop SequenceFile with given key and value types.
+   *
+   * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
+   * record, directly caching the returned RDD will create many references to the same object.
+   * If you plan to directly cache Hadoop writable objects, you should first copy them using
+   * a `map` function.
+   */
   def sequenceFile[K, V](path: String,
     keyClass: Class[K],
     valueClass: Class[V],
@@ -237,13 +313,14 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
     new JavaPairRDD(sc.sequenceFile(path, keyClass, valueClass, minPartitions))
   }
 
-  /** Get an RDD for a Hadoop SequenceFile.
-    *
-    * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
-    * record, directly caching the returned RDD will create many references to the same object.
-    * If you plan to directly cache Hadoop writable objects, you should first copy them using
-    * a `map` function.
-    */
+  /**
+   * Get an RDD for a Hadoop SequenceFile.
+   *
+   * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
+   * record, directly caching the returned RDD will create many references to the same object.
+   * If you plan to directly cache Hadoop writable objects, you should first copy them using
+   * a `map` function.
+   */
   def sequenceFile[K, V](path: String, keyClass: Class[K], valueClass: Class[V]):
   JavaPairRDD[K, V] = {
     implicit val ctagK: ClassTag[K] = ClassTag(keyClass)
@@ -276,9 +353,18 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   }
 
   /**
-   * Get an RDD for a Hadoop-readable dataset from a Hadooop JobConf giving its InputFormat and any
+   * Get an RDD for a Hadoop-readable dataset from a Hadoop JobConf giving its InputFormat and any
    * other necessary info (e.g. file name for a filesystem-based dataset, table name for HyperTable,
    * etc).
+   *
+   * @param conf JobConf for setting up the dataset. Note: This will be put into a Broadcast.
+   *             Therefore if you plan to reuse this conf to create multiple RDDs, you need to make
+   *             sure you won't modify the conf. A safe approach is always creating a new conf for
+   *             a new RDD.
+   * @param inputFormatClass Class of the InputFormat
+   * @param keyClass Class of the keys
+   * @param valueClass Class of the values
+   * @param minPartitions Minimum number of Hadoop Splits to generate.
    *
    * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
    * record, directly caching the returned RDD will create many references to the same object.
@@ -299,8 +385,16 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   }
 
   /**
-   * Get an RDD for a Hadoop-readable dataset from a Hadooop JobConf giving its InputFormat and any
+   * Get an RDD for a Hadoop-readable dataset from a Hadoop JobConf giving its InputFormat and any
    * other necessary info (e.g. file name for a filesystem-based dataset, table name for HyperTable,
+   *
+   * @param conf JobConf for setting up the dataset. Note: This will be put into a Broadcast.
+   *             Therefore if you plan to reuse this conf to create multiple RDDs, you need to make
+   *             sure you won't modify the conf. A safe approach is always creating a new conf for
+   *             a new RDD.
+   * @param inputFormatClass Class of the InputFormat
+   * @param keyClass Class of the keys
+   * @param valueClass Class of the values
    *
    * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
    * record, directly caching the returned RDD will create many references to the same object.
@@ -319,13 +413,14 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
     new JavaHadoopRDD(rdd.asInstanceOf[HadoopRDD[K, V]])
   }
 
-  /** Get an RDD for a Hadoop file with an arbitrary InputFormat.
-    *
-    * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
-    * record, directly caching the returned RDD will create many references to the same object.
-    * If you plan to directly cache Hadoop writable objects, you should first copy them using
-    * a `map` function.
-    */
+  /**
+   * Get an RDD for a Hadoop file with an arbitrary InputFormat.
+   *
+   * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
+   * record, directly caching the returned RDD will create many references to the same object.
+   * If you plan to directly cache Hadoop writable objects, you should first copy them using
+   * a `map` function.
+   */
   def hadoopFile[K, V, F <: InputFormat[K, V]](
     path: String,
     inputFormatClass: Class[F],
@@ -339,13 +434,14 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
     new JavaHadoopRDD(rdd.asInstanceOf[HadoopRDD[K, V]])
   }
 
-  /** Get an RDD for a Hadoop file with an arbitrary InputFormat
-    *
-    * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
-    * record, directly caching the returned RDD will create many references to the same object.
-    * If you plan to directly cache Hadoop writable objects, you should first copy them using
-    * a `map` function.
-    */
+  /**
+   * Get an RDD for a Hadoop file with an arbitrary InputFormat
+   *
+   * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
+   * record, directly caching the returned RDD will create many references to the same object.
+   * If you plan to directly cache Hadoop writable objects, you should first copy them using
+   * a `map` function.
+   */
   def hadoopFile[K, V, F <: InputFormat[K, V]](
     path: String,
     inputFormatClass: Class[F],
@@ -383,6 +479,14 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * Get an RDD for a given Hadoop file with an arbitrary new API InputFormat
    * and extra configuration options to pass to the input format.
    *
+   * @param conf Configuration for setting up the dataset. Note: This will be put into a Broadcast.
+   *             Therefore if you plan to reuse this conf to create multiple RDDs, you need to make
+   *             sure you won't modify the conf. A safe approach is always creating a new conf for
+   *             a new RDD.
+   * @param fClass Class of the InputFormat
+   * @param kClass Class of the keys
+   * @param vClass Class of the values
+   *
    * '''Note:''' Because Hadoop's RecordReader class re-uses the same Writable object for each
    * record, directly caching the returned RDD will create many references to the same object.
    * If you plan to directly cache Hadoop writable objects, you should first copy them using
@@ -401,7 +505,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
 
   /** Build the union of two or more RDDs. */
   override def union[T](first: JavaRDD[T], rest: java.util.List[JavaRDD[T]]): JavaRDD[T] = {
-    val rdds: Seq[RDD[T]] = (Seq(first) ++ asScalaBuffer(rest)).map(_.rdd)
+    val rdds: Seq[RDD[T]] = (Seq(first) ++ rest.asScala).map(_.rdd)
     implicit val ctag: ClassTag[T] = first.classTag
     sc.union(rdds)
   }
@@ -409,7 +513,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   /** Build the union of two or more RDDs. */
   override def union[K, V](first: JavaPairRDD[K, V], rest: java.util.List[JavaPairRDD[K, V]])
       : JavaPairRDD[K, V] = {
-    val rdds: Seq[RDD[(K, V)]] = (Seq(first) ++ asScalaBuffer(rest)).map(_.rdd)
+    val rdds: Seq[RDD[(K, V)]] = (Seq(first) ++ rest.asScala).map(_.rdd)
     implicit val ctag: ClassTag[(K, V)] = first.classTag
     implicit val ctagK: ClassTag[K] = first.kClassTag
     implicit val ctagV: ClassTag[V] = first.vClassTag
@@ -418,7 +522,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
 
   /** Build the union of two or more RDDs. */
   override def union(first: JavaDoubleRDD, rest: java.util.List[JavaDoubleRDD]): JavaDoubleRDD = {
-    val rdds: Seq[RDD[Double]] = (Seq(first) ++ asScalaBuffer(rest)).map(_.srdd)
+    val rdds: Seq[RDD[Double]] = (Seq(first) ++ rest.asScala).map(_.srdd)
     new JavaDoubleRDD(sc.union(rdds))
   }
 
@@ -426,6 +530,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * Create an [[org.apache.spark.Accumulator]] integer variable, which tasks can "add" values
    * to using the `add` method. Only the master can access the accumulator's `value`.
    */
+  @deprecated("use sc().longAccumulator()", "2.0.0")
   def intAccumulator(initialValue: Int): Accumulator[java.lang.Integer] =
     sc.accumulator(initialValue)(IntAccumulatorParam).asInstanceOf[Accumulator[java.lang.Integer]]
 
@@ -435,6 +540,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    *
    * This version supports naming the accumulator for display in Spark's web UI.
    */
+  @deprecated("use sc().longAccumulator(String)", "2.0.0")
   def intAccumulator(initialValue: Int, name: String): Accumulator[java.lang.Integer] =
     sc.accumulator(initialValue, name)(IntAccumulatorParam)
       .asInstanceOf[Accumulator[java.lang.Integer]]
@@ -443,6 +549,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * Create an [[org.apache.spark.Accumulator]] double variable, which tasks can "add" values
    * to using the `add` method. Only the master can access the accumulator's `value`.
    */
+  @deprecated("use sc().doubleAccumulator()", "2.0.0")
   def doubleAccumulator(initialValue: Double): Accumulator[java.lang.Double] =
     sc.accumulator(initialValue)(DoubleAccumulatorParam).asInstanceOf[Accumulator[java.lang.Double]]
 
@@ -452,6 +559,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    *
    * This version supports naming the accumulator for display in Spark's web UI.
    */
+  @deprecated("use sc().doubleAccumulator(String)", "2.0.0")
   def doubleAccumulator(initialValue: Double, name: String): Accumulator[java.lang.Double] =
     sc.accumulator(initialValue, name)(DoubleAccumulatorParam)
       .asInstanceOf[Accumulator[java.lang.Double]]
@@ -460,6 +568,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * Create an [[org.apache.spark.Accumulator]] integer variable, which tasks can "add" values
    * to using the `add` method. Only the master can access the accumulator's `value`.
    */
+  @deprecated("use sc().longAccumulator()", "2.0.0")
   def accumulator(initialValue: Int): Accumulator[java.lang.Integer] = intAccumulator(initialValue)
 
   /**
@@ -468,6 +577,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    *
    * This version supports naming the accumulator for display in Spark's web UI.
    */
+  @deprecated("use sc().longAccumulator(String)", "2.0.0")
   def accumulator(initialValue: Int, name: String): Accumulator[java.lang.Integer] =
     intAccumulator(initialValue, name)
 
@@ -475,6 +585,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * Create an [[org.apache.spark.Accumulator]] double variable, which tasks can "add" values
    * to using the `add` method. Only the master can access the accumulator's `value`.
    */
+  @deprecated("use sc().doubleAccumulator()", "2.0.0")
   def accumulator(initialValue: Double): Accumulator[java.lang.Double] =
     doubleAccumulator(initialValue)
 
@@ -485,6 +596,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    *
    * This version supports naming the accumulator for display in Spark's web UI.
    */
+  @deprecated("use sc().doubleAccumulator(String)", "2.0.0")
   def accumulator(initialValue: Double, name: String): Accumulator[java.lang.Double] =
     doubleAccumulator(initialValue, name)
 
@@ -492,6 +604,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * Create an [[org.apache.spark.Accumulator]] variable of a given type, which tasks can "add"
    * values to using the `add` method. Only the master can access the accumulator's `value`.
    */
+  @deprecated("use AccumulatorV2", "2.0.0")
   def accumulator[T](initialValue: T, accumulatorParam: AccumulatorParam[T]): Accumulator[T] =
     sc.accumulator(initialValue)(accumulatorParam)
 
@@ -501,23 +614,26 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    *
    * This version supports naming the accumulator for display in Spark's web UI.
    */
+  @deprecated("use AccumulatorV2", "2.0.0")
   def accumulator[T](initialValue: T, name: String, accumulatorParam: AccumulatorParam[T])
       : Accumulator[T] =
     sc.accumulator(initialValue, name)(accumulatorParam)
 
   /**
    * Create an [[org.apache.spark.Accumulable]] shared variable of the given type, to which tasks
-   * can "add" values with `add`. Only the master can access the accumuable's `value`.
+   * can "add" values with `add`. Only the master can access the accumulable's `value`.
    */
+  @deprecated("use AccumulatorV2", "2.0.0")
   def accumulable[T, R](initialValue: T, param: AccumulableParam[T, R]): Accumulable[T, R] =
     sc.accumulable(initialValue)(param)
 
   /**
    * Create an [[org.apache.spark.Accumulable]] shared variable of the given type, to which tasks
-   * can "add" values with `add`. Only the master can access the accumuable's `value`.
+   * can "add" values with `add`. Only the master can access the accumulable's `value`.
    *
    * This version supports naming the accumulator for display in Spark's web UI.
    */
+  @deprecated("use AccumulatorV2", "2.0.0")
   def accumulable[T, R](initialValue: T, name: String, param: AccumulableParam[T, R])
       : Accumulable[T, R] =
     sc.accumulable(initialValue, name)(param)
@@ -534,6 +650,8 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
     sc.stop()
   }
 
+  override def close(): Unit = stop()
+
   /**
    * Get Spark's home location from either a value set through the constructor,
    * or the spark.home Java property, or the SPARK_HOME environment variable
@@ -545,7 +663,7 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * Add a file to be downloaded with this Spark job on every node.
    * The `path` passed can be either a local file, a file in HDFS (or other Hadoop-supported
    * filesystems), or an HTTP, HTTPS or FTP URI.  To access the file in Spark jobs,
-   * use `SparkFiles.get(path)` to find its download location.
+   * use `SparkFiles.get(fileName)` to find its download location.
    */
   def addFile(path: String) {
     sc.addFile(path)
@@ -561,25 +679,10 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   }
 
   /**
-   * Clear the job's list of JARs added by `addJar` so that they do not get downloaded to
-   * any new nodes.
-   */
-  @deprecated("adding jars no longer creates local copies that need to be deleted", "1.0.0")
-  def clearJars() {
-    sc.clearJars()
-  }
-
-  /**
-   * Clear the job's list of files added by `addFile` so that they do not get downloaded to
-   * any new nodes.
-   */
-  @deprecated("adding files no longer creates local copies that need to be deleted", "1.0.0")
-  def clearFiles() {
-    sc.clearFiles()
-  }
-
-  /**
    * Returns the Hadoop configuration used for the Hadoop code (e.g. file systems) we reuse.
+   *
+   * '''Note:''' As it will be reused in all Hadoop RDDs, it's better not to modify it unless you
+   * plan to set some global configurations for all Hadoop RDDs.
    */
   def hadoopConfiguration(): Configuration = {
     sc.hadoopConfiguration
@@ -621,8 +724,13 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
   }
 
   /**
-   * Set a local property that affects jobs submitted from this thread, such as the
-   * Spark fair scheduler pool.
+   * Set a local property that affects jobs submitted from this thread, and all child
+   * threads, such as the Spark fair scheduler pool.
+   *
+   * These properties are inherited by child threads spawned from this thread. This
+   * may have unexpected consequences when working with thread pools. The standard java
+   * implementation of thread pools have worker threads spawn other worker threads.
+   * As a result, local properties may propagate unpredictably.
    */
   def setLocalProperty(key: String, value: String): Unit = sc.setLocalProperty(key, value)
 
@@ -631,6 +739,14 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
    * [[org.apache.spark.api.java.JavaSparkContext.setLocalProperty]].
    */
   def getLocalProperty(key: String): String = sc.getLocalProperty(key)
+
+  /** Control our logLevel. This overrides any user-defined log settings.
+   * @param logLevel The desired log level as a string.
+   * Valid log levels include: ALL, DEBUG, ERROR, FATAL, INFO, OFF, TRACE, WARN
+   */
+  def setLogLevel(logLevel: String) {
+    sc.setLogLevel(logLevel)
+  }
 
   /**
    * Assigns a group ID to all the jobs started by this thread until the group ID is set to a
@@ -679,6 +795,16 @@ class JavaSparkContext(val sc: SparkContext) extends JavaSparkContextVarargsWork
 
   /** Cancel all jobs that have been scheduled or are running. */
   def cancelAllJobs(): Unit = sc.cancelAllJobs()
+
+  /**
+   * Returns a Java map of JavaRDDs that have marked themselves as persistent via cache() call.
+   * Note that this does not necessarily mean the caching or computation was successful.
+   */
+  def getPersistentRDDs: JMap[java.lang.Integer, JavaRDD[_]] = {
+    sc.getPersistentRDDs.mapValues(s => JavaRDD.fromRDD(s))
+      .asJava.asInstanceOf[JMap[java.lang.Integer, JavaRDD[_]]]
+  }
+
 }
 
 object JavaSparkContext {

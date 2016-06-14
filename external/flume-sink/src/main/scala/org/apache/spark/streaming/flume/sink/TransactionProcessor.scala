@@ -22,7 +22,7 @@ import java.util.concurrent.{Callable, CountDownLatch, TimeUnit}
 
 import scala.util.control.Breaks
 
-import org.apache.flume.{Transaction, Channel}
+import org.apache.flume.{Channel, Transaction}
 
 // Flume forces transactions to be thread-local (horrible, I know!)
 // So the sink basically spawns a new thread to pull the events out within a transaction.
@@ -60,6 +60,12 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
   // succeeded.
   @volatile private var batchSuccess = false
 
+  @volatile private var stopped = false
+
+  @volatile private var isTest = false
+
+  private var testLatch: CountDownLatch = null
+
   // The transaction that this processor would handle
   var txOpt: Option[Transaction] = None
 
@@ -88,6 +94,11 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
     batchAckLatch.countDown()
   }
 
+  private[flume] def shutdown(): Unit = {
+    logDebug("Shutting down transaction processor")
+    stopped = true
+  }
+
   /**
    * Populates events into the event batch. If the batch cannot be populated,
    * this method will not set the events into the event batch, but it sets an error message.
@@ -99,14 +110,14 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
         eventBatch.setErrorMsg("Something went wrong. Channel was " +
           "unable to create a transaction!")
       }
-      txOpt.foreach(tx => {
+      txOpt.foreach { tx =>
         tx.begin()
         val events = new util.ArrayList[SparkSinkEvent](maxBatchSize)
         val loop = new Breaks
         var gotEventsInThisTxn = false
         var loopCounter: Int = 0
         loop.breakable {
-          while (events.size() < maxBatchSize
+          while (!stopped && events.size() < maxBatchSize
             && loopCounter < totalAttemptsToRemoveFromChannel) {
             loopCounter += 1
             Option(channel.take()) match {
@@ -115,7 +126,7 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
                   ByteBuffer.wrap(event.getBody)))
                 gotEventsInThisTxn = true
               case None =>
-                if (!gotEventsInThisTxn) {
+                if (!gotEventsInThisTxn && !stopped) {
                   logDebug("Sleeping for " + backOffInterval + " millis as no events were read in" +
                     " the current transaction")
                   TimeUnit.MILLISECONDS.sleep(backOffInterval)
@@ -125,24 +136,29 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
             }
           }
         }
-        if (!gotEventsInThisTxn) {
+        if (!gotEventsInThisTxn && !stopped) {
           val msg = "Tried several times, " +
             "but did not get any events from the channel!"
           logWarning(msg)
           eventBatch.setErrorMsg(msg)
         } else {
           // At this point, the events are available, so fill them into the event batch
-          eventBatch = new EventBatch("",seqNum, events)
+          eventBatch = new EventBatch("", seqNum, events)
         }
-      })
+      }
     } catch {
+      case interrupted: InterruptedException =>
+        // Don't pollute logs if the InterruptedException came from this being stopped
+        if (!stopped) {
+          logWarning("Error while processing transaction.", interrupted)
+        }
       case e: Exception =>
         logWarning("Error while processing transaction.", e)
         eventBatch.setErrorMsg(e.getMessage)
         try {
-          txOpt.foreach(tx => {
+          txOpt.foreach { tx =>
             rollbackAndClose(tx, close = true)
-          })
+          }
         } finally {
           txOpt = None
         }
@@ -158,7 +174,7 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
    */
   private def processAckOrNack() {
     batchAckLatch.await(transactionTimeout, TimeUnit.SECONDS)
-    txOpt.foreach(tx => {
+    txOpt.foreach { tx =>
       if (batchSuccess) {
         try {
           logDebug("Committing transaction")
@@ -170,6 +186,9 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
             rollbackAndClose(tx, close = false) // tx will be closed later anyway
         } finally {
           tx.close()
+          if (isTest) {
+            testLatch.countDown()
+          }
         }
       } else {
         logWarning("Spark could not commit transaction, NACK received. Rolling back transaction.")
@@ -178,7 +197,7 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
         // cause issues. This is required to ensure the TransactionProcessor instance is not leaked
         parent.removeAndGetProcessor(seqNum)
       }
-    })
+    }
   }
 
   /**
@@ -224,5 +243,10 @@ private class TransactionProcessor(val channel: Channel, val seqNum: String,
     populateEvents()
     processAckOrNack()
     null
+  }
+
+  private[sink] def countDownWhenBatchAcked(latch: CountDownLatch) {
+    testLatch = latch
+    isTest = true
   }
 }

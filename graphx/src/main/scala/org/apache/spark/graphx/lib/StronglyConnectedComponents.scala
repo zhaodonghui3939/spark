@@ -36,6 +36,8 @@ object StronglyConnectedComponents {
    * @return a graph with vertex attributes containing the smallest vertex id in each SCC
    */
   def run[VD: ClassTag, ED: ClassTag](graph: Graph[VD, ED], numIter: Int): Graph[VertexId, ED] = {
+    require(numIter > 0, s"Number of iterations must be greater than 0," +
+      s" but got ${numIter}")
 
     // the graph we update with final SCC ids, and the graph we return at the end
     var sccGraph = graph.mapVertices { case (vid, _) => vid }
@@ -75,7 +77,7 @@ object StronglyConnectedComponents {
         sccWorkGraph, Long.MaxValue, activeDirection = EdgeDirection.Out)(
         (vid, myScc, neighborScc) => (math.min(myScc._1, neighborScc), myScc._2),
         e => {
-          if (e.srcId < e.dstId) {
+          if (e.srcAttr._1 < e.dstAttr._1) {
             Iterator((e.dstId, e.srcAttr._1))
           } else {
             Iterator()

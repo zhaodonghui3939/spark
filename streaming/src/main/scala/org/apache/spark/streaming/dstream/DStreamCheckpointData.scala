@@ -17,16 +17,19 @@
 
 package org.apache.spark.streaming.dstream
 
+import java.io.{IOException, ObjectInputStream, ObjectOutputStream}
+
 import scala.collection.mutable.HashMap
 import scala.reflect.ClassTag
-import java.io.{ObjectOutputStream, ObjectInputStream, IOException}
-import org.apache.hadoop.fs.Path
-import org.apache.hadoop.fs.FileSystem
-import org.apache.spark.Logging
+
+import org.apache.hadoop.fs.{FileSystem, Path}
+
+import org.apache.spark.internal.Logging
 import org.apache.spark.streaming.Time
+import org.apache.spark.util.Utils
 
 private[streaming]
-class DStreamCheckpointData[T: ClassTag] (dstream: DStream[T])
+class DStreamCheckpointData[T: ClassTag](dstream: DStream[T])
   extends Serializable with Logging {
   protected val data = new HashMap[Time, AnyRef]()
 
@@ -36,13 +39,13 @@ class DStreamCheckpointData[T: ClassTag] (dstream: DStream[T])
   // in that batch's checkpoint data
   @transient private var timeToOldestCheckpointFileTime = new HashMap[Time, Time]
 
-  @transient private var fileSystem : FileSystem = null
+  @transient private var fileSystem: FileSystem = null
   protected[streaming] def currentCheckpointFiles = data.asInstanceOf[HashMap[Time, String]]
 
   /**
    * Updates the checkpoint data of the DStream. This gets called every time
    * the graph checkpoint is initiated. Default implementation records the
-   * checkpoint files to which the generate RDDs of the DStream has been saved.
+   * checkpoint files at which the generated RDDs of the DStream have been saved.
    */
   def update(time: Time) {
 
@@ -100,26 +103,25 @@ class DStreamCheckpointData[T: ClassTag] (dstream: DStream[T])
 
   /**
    * Restore the checkpoint data. This gets called once when the DStream graph
-   * (along with its DStreams) are being restored from a graph checkpoint file.
+   * (along with its output DStreams) is being restored from a graph checkpoint file.
    * Default implementation restores the RDDs from their checkpoint files.
    */
   def restore() {
     // Create RDDs from the checkpoint data
     currentCheckpointFiles.foreach {
-      case(time, file) => {
+      case(time, file) =>
         logInfo("Restoring checkpointed RDD for time " + time + " from file '" + file + "'")
         dstream.generatedRDDs += ((time, dstream.context.sparkContext.checkpointFile[T](file)))
-      }
     }
   }
 
-  override def toString() = {
+  override def toString: String = {
     "[\n" + currentCheckpointFiles.size + " checkpoint files \n" +
       currentCheckpointFiles.mkString("\n") + "\n]"
   }
 
   @throws(classOf[IOException])
-  private def writeObject(oos: ObjectOutputStream) {
+  private def writeObject(oos: ObjectOutputStream): Unit = Utils.tryOrIOException {
     logDebug(this.getClass().getSimpleName + ".writeObject used")
     if (dstream.context.graph != null) {
       dstream.context.graph.synchronized {
@@ -142,7 +144,7 @@ class DStreamCheckpointData[T: ClassTag] (dstream: DStream[T])
   }
 
   @throws(classOf[IOException])
-  private def readObject(ois: ObjectInputStream) {
+  private def readObject(ois: ObjectInputStream): Unit = Utils.tryOrIOException {
     logDebug(this.getClass().getSimpleName + ".readObject used")
     ois.defaultReadObject()
     timeToOldestCheckpointFileTime = new HashMap[Time, Time]

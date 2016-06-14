@@ -17,6 +17,8 @@
 
 package org.apache.spark.ui.jobs
 
+import java.net.URLEncoder
+
 import scala.collection.mutable.HashMap
 import scala.xml.Node
 
@@ -24,9 +26,8 @@ import org.apache.spark.scheduler.{Schedulable, StageInfo}
 import org.apache.spark.ui.UIUtils
 
 /** Table showing list of pools */
-private[ui] class PoolTable(pools: Seq[Schedulable], parent: JobProgressTab) {
-  private val basePath = parent.basePath
-  private val listener = parent.listener
+private[ui] class PoolTable(pools: Seq[Schedulable], parent: StagesTab) {
+  private val listener = parent.progressListener
 
   def toNodeSeq: Seq[Node] = {
     listener.synchronized {
@@ -59,11 +60,11 @@ private[ui] class PoolTable(pools: Seq[Schedulable], parent: JobProgressTab) {
       case Some(stages) => stages.size
       case None => 0
     }
+    val href = "%s/stages/pool?poolname=%s"
+      .format(UIUtils.prependBaseUri(parent.basePath), URLEncoder.encode(p.name, "UTF-8"))
     <tr>
       <td>
-        <a href={"%s/stages/pool?poolname=%s".format(UIUtils.prependBaseUri(basePath), p.name)}>
-          {p.name}
-        </a>
+        <a href={href}>{p.name}</a>
       </td>
       <td>{p.minShare}</td>
       <td>{p.weight}</td>

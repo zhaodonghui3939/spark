@@ -53,7 +53,6 @@ import org.apache.flume.sink.AbstractSink
  *
  */
 
-private[flume]
 class SparkSink extends AbstractSink with Logging with Configurable {
 
   // Size of the pool to use for holding transaction processors.
@@ -89,23 +88,23 @@ class SparkSink extends AbstractSink with Logging with Configurable {
     // dependencies which are being excluded in the build. In practice,
     // Netty dependencies are already available on the JVM as Flume would have pulled them in.
     serverOpt = Option(new NettyServer(responder, new InetSocketAddress(hostname, port)))
-    serverOpt.foreach(server => {
+    serverOpt.foreach { server =>
       logInfo("Starting Avro server for sink: " + getName)
       server.start()
-    })
+    }
     super.start()
   }
 
   override def stop() {
     logInfo("Stopping Spark Sink: " + getName)
-    handler.foreach(callbackHandler => {
+    handler.foreach { callbackHandler =>
       callbackHandler.shutdown()
-    })
-    serverOpt.foreach(server => {
+    }
+    serverOpt.foreach { server =>
       logInfo("Stopping Avro Server for sink: " + getName)
       server.close()
       server.join()
-    })
+    }
     blockingLatch.countDown()
     super.stop()
   }
@@ -130,6 +129,24 @@ class SparkSink extends AbstractSink with Logging with Configurable {
     logInfo("Blocking Sink Runner, sink will continue to run..")
     blockingLatch.await()
     Status.BACKOFF
+  }
+
+  private[flume] def getPort(): Int = {
+    serverOpt
+      .map(_.getPort)
+      .getOrElse(
+        throw new RuntimeException("Server was not started!")
+      )
+  }
+
+  /**
+   * Pass in a [[CountDownLatch]] for testing purposes. This batch is counted down when each
+   * batch is received. The test can simply call await on this latch till the expected number of
+   * batches are received.
+   * @param latch
+   */
+  private[flume] def countdownWhenBatchReceived(latch: CountDownLatch) {
+    handler.foreach(_.countDownWhenBatchAcked(latch))
   }
 }
 

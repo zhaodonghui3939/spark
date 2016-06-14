@@ -17,6 +17,8 @@
 
 package org.apache.spark.executor
 
+import org.apache.spark.util.SparkExitCode._
+
 /**
  * These are exit codes that executors should use to provide the master with information about
  * executor failures assuming that cluster management framework can capture the exit codes (but
@@ -27,25 +29,21 @@ package org.apache.spark.executor
  */
 private[spark]
 object ExecutorExitCode {
-  /** The default uncaught exception handler was reached. */
-  val UNCAUGHT_EXCEPTION = 50
-
-  /** The default uncaught exception handler was called and an exception was encountered while
-      logging the exception. */
-  val UNCAUGHT_EXCEPTION_TWICE = 51
-
-  /** The default uncaught exception handler was reached, and the uncaught exception was an
-      OutOfMemoryError. */
-  val OOM = 52
 
   /** DiskStore failed to create a local temporary directory after many attempts. */
   val DISK_STORE_FAILED_TO_CREATE_DIR = 53
 
-  /** TachyonStore failed to initialize after many attempts. */
-  val TACHYON_STORE_FAILED_TO_INITIALIZE = 54
+  /** ExternalBlockStore failed to initialize after many attempts. */
+  val EXTERNAL_BLOCK_STORE_FAILED_TO_INITIALIZE = 54
 
-  /** TachyonStore failed to create a local temporary directory after many attempts. */
-  val TACHYON_STORE_FAILED_TO_CREATE_DIR = 55
+  /** ExternalBlockStore failed to create a local temporary directory after many attempts. */
+  val EXTERNAL_BLOCK_STORE_FAILED_TO_CREATE_DIR = 55
+
+  /**
+   * Executor is unable to send heartbeats to the driver more than
+   * "spark.executor.heartbeat.maxFailures" times.
+   */
+  val HEARTBEAT_FAILURE = 56
 
   def explainExitCode(exitCode: Int): String = {
     exitCode match {
@@ -54,9 +52,13 @@ object ExecutorExitCode {
       case OOM => "OutOfMemoryError"
       case DISK_STORE_FAILED_TO_CREATE_DIR =>
         "Failed to create local directory (bad spark.local.dir?)"
-      case TACHYON_STORE_FAILED_TO_INITIALIZE => "TachyonStore failed to initialize."
-      case TACHYON_STORE_FAILED_TO_CREATE_DIR =>
-        "TachyonStore failed to create a local temporary directory."
+      // TODO: replace external block store with concrete implementation name
+      case EXTERNAL_BLOCK_STORE_FAILED_TO_INITIALIZE => "ExternalBlockStore failed to initialize."
+      // TODO: replace external block store with concrete implementation name
+      case EXTERNAL_BLOCK_STORE_FAILED_TO_CREATE_DIR =>
+        "ExternalBlockStore failed to create a local temporary directory."
+      case HEARTBEAT_FAILURE =>
+        "Unable to send heartbeats to driver."
       case _ =>
         "Unknown executor exit code (" + exitCode + ")" + (
           if (exitCode > 128) {
